@@ -5,9 +5,9 @@
 ## Links
 
 - **Live app:** https://ajaia-docs-15fi.onrender.com
-- **Source code (GitHub):** GITHUB_URL_HERE
-- **Google Drive folder:** DRIVE_URL_HERE
-- **Walkthrough video:** VIDEO_URL_HERE (also in `VIDEO_URL.txt`)
+- **Source code (GitHub):** https://github.com/ujpjm30/ajaia-docs
+- **Google Drive folder:** this folder (all materials below are included)
+- **Walkthrough video:** https://www.loom.com/share/dc54659185f24453ac17ae5b8c754dd6 (also in `VIDEO_URL.txt`)
 
 The app runs on Render's free plan. If the first load is slow, wait up to a minute for the server to wake up and refresh.
 

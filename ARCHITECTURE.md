@@ -22,7 +22,7 @@ One FastAPI process serves both the API and the frontend. There is no separate f
 
 A shared document is only useful if people trust it. Two questions come up quickly once more than one person works on a doc: "who changed this, and who can see it?" and "did my edit just wipe out someone else's?" Most of the extra time went into answering those two questions well, instead of adding more formatting options or a second upload type.
 
-This comes from my background in compliance work (NIST 800-53), where access changes must be auditable and data must not be lost silently. The activity log maps directly to the audit and accountability controls in that framework.
+This comes from my work on NIST 800-53 tooling: a compliance RAG pipeline over the control catalog, and contributions to OSCAL Compass, an open-source compliance automation project. NIST 800-53 has a full control family for Audit and Accountability (AU), and that shaped how I think about shared data. Access changes should be recorded, and data should never be lost silently.
 
 ## What I prioritized and why
 
