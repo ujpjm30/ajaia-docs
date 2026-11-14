@@ -3,12 +3,12 @@
 One FastAPI process serves the JSON API under /api and the static frontend.
 """
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
@@ -16,10 +16,14 @@ from sqlalchemy.orm import Session
 
 from . import db as db_module
 from .content import ImportError_, file_to_html, html_to_markdown, sanitize_html, title_from_filename
-from .models import Document, DocumentShare, User, utcnow
+from .models import ActivityEvent, Document, DocumentShare, User, utcnow
 from .seed import seed_users
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+# Autosave fires every second while someone types. Consecutive edits by the same
+# person within this window are merged into one "edited" activity entry.
+EDIT_MERGE_WINDOW = timedelta(minutes=10)
 
 
 def init_db(engine) -> None:
@@ -55,6 +59,8 @@ class DocumentSummary(BaseModel):
 
 class DocumentDetail(DocumentSummary):
     content: str
+    version: int
+    updated_by: Optional[UserOut]
 
 
 class DocumentList(BaseModel):
@@ -70,6 +76,9 @@ class DocumentCreate(BaseModel):
 class DocumentUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
     content: Optional[str] = Field(default=None, max_length=1_000_000)
+    # The content version the client last loaded. If someone else saved since,
+    # the server rejects the save with 409 instead of silently overwriting.
+    base_version: Optional[int] = None
 
     @field_validator("title")
     @classmethod
@@ -87,6 +96,13 @@ class ShareCreate(BaseModel):
 class ShareOut(BaseModel):
     user: UserOut
     role: str
+
+
+class ActivityOut(BaseModel):
+    actor: UserOut
+    action: str
+    detail: str
+    created_at: datetime
 
 
 # ---------- Auth and access helpers ----------
@@ -126,22 +142,48 @@ def load_doc(doc_id: int, user: User, db: Session, need: str = "view") -> tuple[
     return doc, level
 
 
+def log_activity(db: Session, doc: Document, actor: User, action: str, detail: str = "") -> None:
+    if action == "edited":
+        last = db.scalar(
+            select(ActivityEvent)
+            .where(ActivityEvent.document_id == doc.id)
+            .order_by(ActivityEvent.id.desc())
+            .limit(1)
+        )
+        if (
+            last is not None
+            and last.action == "edited"
+            and last.actor_id == actor.id
+            and utcnow() - as_utc(last.created_at) < EDIT_MERGE_WINDOW
+        ):
+            last.created_at = utcnow()  # extend the existing entry instead of adding a new one
+            return
+    db.add(ActivityEvent(document_id=doc.id, actor_id=actor.id, action=action, detail=detail))
+
+
+def as_utc(value: datetime) -> datetime:
+    # SQLite drops timezone info. All values are stored in UTC.
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 def to_user(u: User) -> UserOut:
     return UserOut(id=u.id, name=u.name, email=u.email)
 
 
 def to_summary(doc: Document, level: str) -> DocumentSummary:
-    updated = doc.updated_at
-    if updated.tzinfo is None:  # SQLite drops timezone info. Values are stored in UTC.
-        updated = updated.replace(tzinfo=timezone.utc)
     return DocumentSummary(
         id=doc.id, title=doc.title, owner=to_user(doc.owner),
-        updated_at=updated, access=level,
+        updated_at=as_utc(doc.updated_at), access=level,
     )
 
 
 def to_detail(doc: Document, level: str) -> DocumentDetail:
-    return DocumentDetail(**to_summary(doc, level).model_dump(), content=doc.content)
+    return DocumentDetail(
+        **to_summary(doc, level).model_dump(),
+        content=doc.content,
+        version=doc.version,
+        updated_by=to_user(doc.updated_by) if doc.updated_by else None,
+    )
 
 
 # ---------- Routes ----------
@@ -162,7 +204,7 @@ def list_documents(user: User = Depends(current_user), db: Session = Depends(db_
         select(Document).where(Document.owner_id == user.id).order_by(Document.updated_at.desc())
     ).all()
     shares = db.scalars(select(DocumentShare).where(DocumentShare.user_id == user.id)).all()
-    shared = sorted((s for s in shares), key=lambda s: s.document.updated_at, reverse=True)
+    shared = sorted(shares, key=lambda s: s.document.updated_at, reverse=True)
     return DocumentList(
         owned=[to_summary(d, "owner") for d in owned],
         shared=[to_summary(s.document, s.role) for s in shared],
@@ -179,8 +221,11 @@ def create_document(
         title=body.title.strip() or "Untitled document",
         content=sanitize_html(body.content),
         owner_id=user.id,
+        updated_by_id=user.id,
     )
     db.add(doc)
+    db.flush()  # assigns doc.id so the activity entry can reference it
+    log_activity(db, doc, user, "created")
     db.commit()
     db.refresh(doc)
     return to_detail(doc, "owner")
@@ -197,8 +242,13 @@ async def import_document(
         content = file_to_html(file.filename or "", data)
     except ImportError_ as exc:
         raise HTTPException(400, str(exc))
-    doc = Document(title=title_from_filename(file.filename or ""), content=content, owner_id=user.id)
+    doc = Document(
+        title=title_from_filename(file.filename or ""), content=content,
+        owner_id=user.id, updated_by_id=user.id,
+    )
     db.add(doc)
+    db.flush()
+    log_activity(db, doc, user, "imported", f"from {file.filename}")
     db.commit()
     db.refresh(doc)
     return to_detail(doc, "owner")
@@ -218,13 +268,49 @@ def update_document(
     db: Session = Depends(db_module.get_db),
 ):
     doc, level = load_doc(doc_id, user, db, need="edit")
-    if body.title is not None:
-        doc.title = body.title
+
     if body.content is not None:
+        # Optimistic concurrency: reject a save based on an outdated version.
+        if body.base_version is not None and body.base_version != doc.version:
+            editor = doc.updated_by.name if doc.updated_by else "Someone"
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": f"{editor} saved a newer version of this document.",
+                    "current_version": doc.version,
+                    "updated_by": editor,
+                },
+            )
         doc.content = sanitize_html(body.content)
+        doc.version += 1
+        doc.updated_by_id = user.id
+        log_activity(db, doc, user, "edited")
+
+    # Renaming does not change the content version, so it never causes a conflict.
+    if body.title is not None and body.title != doc.title:
+        log_activity(db, doc, user, "renamed", f'"{doc.title}" to "{body.title}"')
+        doc.title = body.title
+
     doc.updated_at = utcnow()
     db.commit()
+    db.refresh(doc)
     return to_detail(doc, level)
+
+
+@app.get("/api/documents/{doc_id}/activity", response_model=list[ActivityOut])
+def list_activity(doc_id: int, user: User = Depends(current_user), db: Session = Depends(db_module.get_db)):
+    doc, _ = load_doc(doc_id, user, db)
+    events = db.scalars(
+        select(ActivityEvent)
+        .where(ActivityEvent.document_id == doc.id)
+        .order_by(ActivityEvent.id.desc())
+        .limit(50)
+    ).all()
+    return [
+        ActivityOut(actor=to_user(e.actor), action=e.action, detail=e.detail,
+                    created_at=as_utc(e.created_at))
+        for e in events
+    ]
 
 
 @app.get("/api/documents/{doc_id}/export.md")
@@ -267,10 +353,13 @@ def add_share(
         raise HTTPException(400, "The owner already has access")
     share = next((s for s in doc.shares if s.user_id == target.id), None)
     if share:
-        share.role = body.role  # re-sharing updates the role
+        if share.role != body.role:
+            log_activity(db, doc, user, "role_changed", f"{target.name}: {share.role} to {body.role}")
+            share.role = body.role
     else:
         share = DocumentShare(document_id=doc.id, user_id=target.id, role=body.role)
         db.add(share)
+        log_activity(db, doc, user, "shared", f"with {target.name} as {body.role}")
     db.commit()
     return ShareOut(user=to_user(target), role=share.role)
 
@@ -286,6 +375,7 @@ def remove_share(
     share = next((s for s in doc.shares if s.user_id == user_id), None)
     if share is None:
         raise HTTPException(404, "Share not found")
+    log_activity(db, doc, user, "unshared", share.user.name)
     db.delete(share)
     db.commit()
 

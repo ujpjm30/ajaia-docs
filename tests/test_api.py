@@ -126,3 +126,54 @@ def test_export_markdown(client):
     assert r.status_code == 200
     assert "## Agenda" in r.text
     assert "- **one**" in r.text
+
+
+def test_stale_save_is_rejected_with_conflict(client):
+    doc = client.post("/api/documents", json={"title": "Shared draft"}, headers=as_user(ALICE)).json()
+    client.post(f"/api/documents/{doc['id']}/shares",
+                json={"email": "bob@ajaia.test", "role": "editor"}, headers=as_user(ALICE))
+    v1 = doc["version"]
+
+    # Alice and Bob both opened version 1. Bob saves first.
+    r = client.patch(f"/api/documents/{doc['id']}",
+                     json={"content": "<p>Bob's text</p>", "base_version": v1}, headers=as_user(BOB))
+    assert r.status_code == 200
+    assert r.json()["version"] == v1 + 1
+
+    # Alice saves based on the old version. She gets 409, and Bob's text is not overwritten.
+    r = client.patch(f"/api/documents/{doc['id']}",
+                     json={"content": "<p>Alice's text</p>", "base_version": v1}, headers=as_user(ALICE))
+    assert r.status_code == 409
+    assert r.json()["updated_by"] == "Bob Lee"
+    current = client.get(f"/api/documents/{doc['id']}", headers=as_user(ALICE)).json()
+    assert "Bob's text" in current["content"]
+
+    # After reloading the latest version, Alice can save again.
+    r = client.patch(f"/api/documents/{doc['id']}",
+                     json={"content": "<p>Alice's text</p>", "base_version": current["version"]},
+                     headers=as_user(ALICE))
+    assert r.status_code == 200
+
+    # Renaming never conflicts, because it does not change the content version.
+    r = client.patch(f"/api/documents/{doc['id']}", json={"title": "Renamed"}, headers=as_user(BOB))
+    assert r.status_code == 200
+
+
+def test_activity_log_records_access_changes_and_edits(client):
+    doc_id = client.post("/api/documents", json={"title": "Audit me"}, headers=as_user(ALICE)).json()["id"]
+    client.post(f"/api/documents/{doc_id}/shares",
+                json={"email": "bob@ajaia.test", "role": "viewer"}, headers=as_user(ALICE))
+    client.post(f"/api/documents/{doc_id}/shares",
+                json={"email": "bob@ajaia.test", "role": "editor"}, headers=as_user(ALICE))
+    # Several autosaves in a row by Bob become one "edited" entry
+    for i in range(3):
+        client.patch(f"/api/documents/{doc_id}", json={"content": f"<p>draft {i}</p>"}, headers=as_user(BOB))
+    client.delete(f"/api/documents/{doc_id}/shares/{BOB}", headers=as_user(ALICE))
+
+    events = client.get(f"/api/documents/{doc_id}/activity", headers=as_user(ALICE)).json()
+    actions = [e["action"] for e in reversed(events)]  # oldest first
+    assert actions == ["created", "shared", "role_changed", "edited", "unshared"]
+    assert events[0]["actor"]["name"] == "Alice Kim"
+
+    # People without access cannot read the activity log
+    assert client.get(f"/api/documents/{doc_id}/activity", headers=as_user(CAROL)).status_code == 404

@@ -2,7 +2,9 @@
 
 A lightweight collaborative document editor inspired by Google Docs. Users can create and format documents, import files, share documents with other users, and export to Markdown.
 
-**Live app:** LIVE_URL_HERE
+Two things go beyond the basic brief, both aimed at making shared work trustworthy: an **activity log** that records every edit and access change, and **conflict protection** so one person's save never silently overwrites another's.
+
+**Live app:** https://ajaia-docs-15fi.onrender.com
 (Hosted on Render's free plan. The first request after a period of inactivity can take up to a minute while the server wakes up.)
 
 ## Features
@@ -13,6 +15,9 @@ A lightweight collaborative document editor inspired by Google Docs. Users can c
 | File import | Upload a `.txt`, `.md` or `.docx` file (up to 2 MB). It becomes a new editable document with headings, bold and lists preserved. |
 | Sharing | Every document has one owner. The owner can share by email as "Can edit" or "Can view", change the role, or remove access. The sidebar separates "My documents" and "Shared with me". Viewers get a read-only editor. |
 | Persistence | Documents, formatting and shares are stored in a database (SQLite locally, Postgres in production). Refreshing the page reopens the same document. |
+| Activity log | Each document shows who created, imported, renamed, edited, shared, changed a role or removed access, and when. Autosaves by the same person within 10 minutes are merged into one entry. Only people with access can read the log. |
+| Conflict protection | Every save carries the version it was based on. If someone else saved in the meantime, the server rejects the save (HTTP 409) and the editor shows who changed it, with "Load their version" or "Keep mine and overwrite". |
+| Live refresh | An open document checks for changes every 5 seconds. If you have no unsaved edits, other people's changes appear automatically. Role changes and removed access take effect without a reload. |
 | Export | Download any document you can access as Markdown. |
 
 ## Demo accounts
@@ -26,6 +31,8 @@ Login is mocked. Pick a user from the "Signed in as" menu at the top right.
 | Carol Diaz | carol@ajaia.test |
 
 **Try the sharing flow:** as Alice, create a document and click Share. Share it with `bob@ajaia.test` as "Can view". Switch to Bob. The document appears under "Shared with me" and opens read-only. Switch back to Alice, change Bob to "Can edit", and Bob can now edit it. Carol never sees it.
+
+**Try conflict protection:** share a document with Bob as "Can edit". Open the app in a second browser tab and pick Bob there (each tab keeps its own user). Type in both tabs at about the same time. The tab that saves second sees a banner naming the other person, and nothing is overwritten unless that person chooses to.
 
 Sample files for the import feature are in `samples/`.
 
@@ -54,7 +61,7 @@ export DATABASE_URL="postgresql://user:password@host/dbname?sslmode=require"
 pytest -q
 ```
 
-The tests run against an in-memory SQLite database. They cover formatting round trip, HTML sanitizing, the full sharing and permission flow, file import, invalid uploads, missing auth, input validation and Markdown export.
+The tests run against an in-memory SQLite database. They cover formatting round trip, HTML sanitizing, the full sharing and permission flow, file import, invalid uploads, missing auth, input validation, Markdown export, save conflicts and the activity log.
 
 ## Deploy (Render + Neon, both free)
 
@@ -68,8 +75,8 @@ Tables and demo users are created automatically on startup.
 
 ```
 app/
-  main.py      API routes, mocked auth, access checks
-  models.py    User, Document, DocumentShare tables
+  main.py      API routes, mocked auth, access checks, conflict check, activity logging
+  models.py    User, Document, DocumentShare, ActivityEvent tables
   content.py   HTML sanitizing, file import, Markdown export
   db.py        Database engine (SQLite or Postgres)
   seed.py      Demo users

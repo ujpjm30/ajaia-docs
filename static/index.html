@@ -51,6 +51,12 @@
           </div>
         </div>
         <div id="doc-meta" class="meta"></div>
+        <div id="conflict-banner" class="banner" hidden>
+          <span id="conflict-text"></span>
+          <button id="conflict-reload" class="btn">Load their version</button>
+          <button id="conflict-overwrite" class="btn danger">Keep mine and overwrite</button>
+        </div>
+        <div class="doc-body">
         <div class="editor-wrap">
           <div id="toolbar">
             <span class="ql-formats">
@@ -78,6 +84,12 @@
             </span>
           </div>
           <div id="editor"></div>
+        </div>
+        <aside class="activity">
+          <h3>Activity</h3>
+          <p class="hint">Every edit and access change on this document, newest first.</p>
+          <ul id="activity-list" class="activity-list"></ul>
+        </aside>
         </div>
       </section>
     </main>

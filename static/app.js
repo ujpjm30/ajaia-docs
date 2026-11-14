@@ -1,22 +1,28 @@
 // Ajaia Docs frontend. Plain JavaScript, no build step.
 
+const POLL_MS = 5000; // how often an open document checks the server for changes by others
+
 const state = {
   userId: null,
   users: [],
-  doc: null,          // currently open document (from the API)
+  doc: null,          // currently open document (from the API), includes .version
   saveTimer: null,
-  dirty: false,
+  dirty: false,       // local edits not yet saved
+  saving: false,      // a save request is in flight
+  saveQueued: false,  // edits happened while a save was in flight
+  conflict: false,    // someone else saved a newer version, autosave is paused
 };
 
 const $ = (id) => document.getElementById(id);
 
 // ---------- Small helpers ----------
 
+// Per-tab storage, so two tabs can be signed in as two different demo users.
 function storageGet(key) {
-  try { return localStorage.getItem(key); } catch { return null; }
+  try { return sessionStorage.getItem(key); } catch { return null; }
 }
 function storageSet(key, value) {
-  try { localStorage.setItem(key, value); } catch { /* ignore */ }
+  try { sessionStorage.setItem(key, value); } catch { /* ignore */ }
 }
 
 function toast(message, isError = false) {
@@ -25,7 +31,7 @@ function toast(message, isError = false) {
   el.className = "toast" + (isError ? " error" : "");
   el.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { el.hidden = true; }, 3000);
+  toast.timer = setTimeout(() => { el.hidden = true; }, 3500);
 }
 
 async function api(path, options = {}) {
@@ -41,18 +47,28 @@ async function api(path, options = {}) {
   if (!res.ok) {
     let msg = data.detail || `Request failed (${res.status})`;
     if (Array.isArray(msg)) msg = msg.map((d) => d.msg).join(", ");
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function formatTime(iso) {
+  return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 function timeAgo(iso) {
-  const d = new Date(iso);
-  return d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const sec = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (sec < 45) return "just now";
+  if (sec < 3600) return `${Math.round(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.round(sec / 3600)} h ago`;
+  return formatTime(iso);
 }
 
 // ---------- Editor ----------
@@ -66,6 +82,7 @@ const quill = new Quill("#editor", {
 quill.on("text-change", (_delta, _old, source) => {
   if (source !== "user" || !state.doc) return;
   state.dirty = true;
+  if (state.conflict) return; // keep edits locally, but do not autosave until resolved
   setStatus("Unsaved changes");
   clearTimeout(state.saveTimer);
   state.saveTimer = setTimeout(saveContent, 800);
@@ -73,28 +90,53 @@ quill.on("text-change", (_delta, _old, source) => {
 
 function setStatus(text) { $("save-status").textContent = text; }
 
-async function saveContent() {
-  if (!state.doc || !state.dirty) return;
-  clearTimeout(state.saveTimer);
-  const docId = state.doc.id;
+function editorHtml() {
   // Store standard HTML (<ul>/<ol>) instead of Quill's internal markup so the
   // content is portable (export, other editors). Quill 2.0.3 turns every space
   // into &nbsp; here, so we convert those back.
-  const content = quill.getSemanticHTML().replace(/&nbsp;/g, " ");
+  return quill.getSemanticHTML().replace(/&nbsp;/g, " ");
+}
+
+function setEditorHtml(html) {
+  const hadFocus = quill.hasFocus();
+  const range = quill.getSelection();
+  quill.setContents(quill.clipboard.convert({ html: html || "" }), "silent");
+  if (hadFocus && range) quill.setSelection(Math.min(range.index, quill.getLength() - 1), 0, "silent");
+}
+
+async function saveContent() {
+  if (!state.doc || !state.dirty || state.conflict) return;
+  if (state.saving) { state.saveQueued = true; return; } // one save at a time
+  clearTimeout(state.saveTimer);
+  const docId = state.doc.id;
+  state.saving = true;
   state.dirty = false;
   setStatus("Saving...");
   try {
-    const updated = await api(`/api/documents/${docId}`, { method: "PATCH", json: { content } });
+    const updated = await api(`/api/documents/${docId}`, {
+      method: "PATCH",
+      json: { content: editorHtml(), base_version: state.doc.version },
+    });
     if (state.doc && state.doc.id === docId) {
+      state.doc.version = updated.version;
       state.doc.updated_at = updated.updated_at;
-      setStatus("Saved");
+      state.doc.updated_by = updated.updated_by;
+      setStatus(state.dirty ? "Unsaved changes" : "Saved");
       renderMeta();
+      loadActivity();
     }
     refreshLists();
   } catch (err) {
     state.dirty = true;
-    setStatus("Save failed");
-    toast(err.message, true);
+    if (err.status === 409) {
+      showConflict(err.message);
+    } else {
+      setStatus("Save failed");
+      toast(err.message, true);
+    }
+  } finally {
+    state.saving = false;
+    if (state.saveQueued) { state.saveQueued = false; saveContent(); }
   }
 }
 
@@ -102,6 +144,121 @@ async function saveContent() {
 window.addEventListener("beforeunload", (e) => {
   if (state.dirty) { saveContent(); e.preventDefault(); }
 });
+
+// ---------- Conflict handling ----------
+
+function showConflict(message) {
+  state.conflict = true;
+  clearTimeout(state.saveTimer);
+  setStatus("Not saved");
+  $("conflict-text").textContent = `${message} Your latest changes are not saved yet.`;
+  $("conflict-banner").hidden = false;
+}
+
+function clearConflict() {
+  state.conflict = false;
+  $("conflict-banner").hidden = true;
+}
+
+$("conflict-reload").addEventListener("click", async () => {
+  // Discard local edits and load the newest version from the server.
+  state.dirty = false;
+  clearConflict();
+  await openDoc(state.doc.id);
+  toast("Loaded the latest version");
+});
+
+$("conflict-overwrite").addEventListener("click", async () => {
+  // Keep local edits and save them on top of the newest version (deliberate overwrite).
+  try {
+    const latest = await api(`/api/documents/${state.doc.id}`);
+    state.doc.version = latest.version;
+    clearConflict();
+    state.dirty = true;
+    await saveContent();
+  } catch (err) { toast(err.message, true); }
+});
+
+// ---------- Polling for changes by other users ----------
+
+async function pollOpenDoc() {
+  const d = state.doc;
+  if (!d || state.saving || document.hidden) return;
+  let latest;
+  try {
+    latest = await api(`/api/documents/${d.id}`);
+  } catch (err) {
+    if (err.status === 404 && state.doc && state.doc.id === d.id) {
+      // Access was removed or the document was deleted while it was open.
+      state.doc = null;
+      state.dirty = false;
+      clearConflict();
+      history.replaceState(null, "", location.pathname);
+      renderDoc();
+      refreshLists();
+      toast("You no longer have access to this document", true);
+    }
+    return;
+  }
+  if (!state.doc || state.doc.id !== d.id) return; // user switched documents meanwhile
+
+  if (latest.access !== state.doc.access) {
+    // The owner changed this user's role. Re-render with the new permissions.
+    state.doc = latest;
+    state.dirty = false;
+    renderDoc();
+    toast(`Your access changed to: ${latest.access === "viewer" ? "view only" : "can edit"}`);
+    return;
+  }
+
+  if (latest.version > state.doc.version && !state.conflict) {
+    const who = latest.updated_by ? latest.updated_by.name : "Someone";
+    if (state.dirty) {
+      showConflict(`${who} saved a newer version while you were editing.`);
+    } else {
+      setEditorHtml(latest.content);
+      Object.assign(state.doc, { version: latest.version, content: latest.content,
+        updated_at: latest.updated_at, updated_by: latest.updated_by });
+      renderMeta();
+      toast(`Updated with ${who}'s changes`);
+    }
+  }
+  if (latest.title !== state.doc.title && document.activeElement !== $("doc-title")) {
+    state.doc.title = latest.title;
+    $("doc-title").value = latest.title;
+  }
+  loadActivity();
+}
+setInterval(pollOpenDoc, POLL_MS);
+
+// ---------- Activity log ----------
+
+function describe(e) {
+  const d = escapeHtml(e.detail);
+  switch (e.action) {
+    case "created": return "created the document";
+    case "imported": return `imported the document ${d}`;
+    case "renamed": return `renamed it ${d}`;
+    case "edited": return "edited the content";
+    case "shared": return `shared it ${d}`;
+    case "role_changed": return `changed access for ${d}`;
+    case "unshared": return `removed access for ${d}`;
+    default: return `${escapeHtml(e.action)} ${d}`;
+  }
+}
+
+async function loadActivity() {
+  if (!state.doc) return;
+  const docId = state.doc.id;
+  try {
+    const events = await api(`/api/documents/${docId}/activity`);
+    if (!state.doc || state.doc.id !== docId) return;
+    $("activity-list").innerHTML = events.length
+      ? events.map((e) => `<li><strong>${escapeHtml(e.actor.name)}</strong> ${describe(e)}
+          <span class="when" title="${formatTime(e.created_at)}">${timeAgo(e.created_at)}</span></li>`).join("")
+      : `<li class="hint">No activity yet</li>`;
+  } catch { /* the poller will retry */ }
+}
 
 // ---------- Document list ----------
 
@@ -117,7 +274,7 @@ function renderList(el, docs, shared) {
     if (state.doc && state.doc.id === d.id) li.classList.add("active");
     const sub = shared
       ? `from ${escapeHtml(d.owner.name)} · ${d.access === "viewer" ? "view only" : "can edit"}`
-      : `edited ${timeAgo(d.updated_at)}`;
+      : `edited ${formatTime(d.updated_at)}`;
     li.innerHTML = `${escapeHtml(d.title)}<span class="sub">${sub}</span>`;
     li.addEventListener("click", () => openDoc(d.id));
     el.appendChild(li);
@@ -139,7 +296,8 @@ async function refreshLists() {
 function renderMeta() {
   const d = state.doc;
   const ownerText = d.access === "owner" ? "You own this document" : `Owned by ${d.owner.name}`;
-  $("doc-meta").textContent = `${ownerText} · Last edited ${timeAgo(d.updated_at)}`;
+  const by = d.updated_by ? ` by ${d.updated_by.name}` : "";
+  $("doc-meta").textContent = `${ownerText} · Last edited${by} ${formatTime(d.updated_at)}`;
 }
 
 function renderDoc() {
@@ -153,9 +311,9 @@ function renderDoc() {
 
   $("doc-title").value = d.title;
   $("doc-title").disabled = !canEdit;
-  quill.setContents(quill.clipboard.convert({ html: d.content || "" }), "silent");
+  setEditorHtml(d.content);
   quill.enable(canEdit);
-  document.querySelector("#toolbar").style.display = canEdit ? "" : "none";
+  $("toolbar").style.display = canEdit ? "" : "none";
 
   const badge = $("access-badge");
   badge.className = `badge ${d.access}`;
@@ -165,6 +323,7 @@ function renderDoc() {
   $("delete-btn").hidden = !isOwner;
   setStatus(canEdit ? "Saved" : "");
   renderMeta();
+  loadActivity();
 
   document.querySelectorAll(".doc-list li").forEach((li) => {
     li.classList.toggle("active", Number(li.dataset.id) === d.id);
@@ -173,6 +332,8 @@ function renderDoc() {
 
 async function openDoc(id) {
   await saveContent(); // flush pending edits on the current doc first
+  clearConflict();
+  state.dirty = false;
   try {
     state.doc = await api(`/api/documents/${id}`);
     location.hash = `doc/${id}`;
@@ -211,6 +372,7 @@ async function saveTitle() {
     state.doc.updated_at = updated.updated_at;
     renderMeta();
     refreshLists();
+    loadActivity();
   } catch (err) {
     input.value = state.doc.title;
     toast(err.message, true);
@@ -315,8 +477,9 @@ $("share-form").addEventListener("submit", async (e) => {
   try {
     const s = await api(`/api/documents/${state.doc.id}/shares`, { method: "POST", json: { email, role } });
     $("share-email").value = "";
-    toast(`Shared with ${s.user.name}`);
+    toast(`${s.user.name} can now ${s.role === "viewer" ? "view" : "edit"}`);
     renderShares();
+    loadActivity();
   } catch (err) {
     $("share-error").textContent = err.message;
   }
@@ -328,6 +491,7 @@ $("share-list").addEventListener("click", async (e) => {
   try {
     await api(`/api/documents/${state.doc.id}/shares/${btn.dataset.user}`, { method: "DELETE" });
     renderShares();
+    loadActivity();
   } catch (err) {
     $("share-error").textContent = err.message;
   }
@@ -342,6 +506,8 @@ $("user-select").addEventListener("change", async (e) => {
   state.userId = e.target.value;
   storageSet("ajaia-user", state.userId);
   state.doc = null;
+  state.dirty = false;
+  clearConflict();
   history.replaceState(null, "", location.pathname);
   renderDoc();
   refreshLists();
