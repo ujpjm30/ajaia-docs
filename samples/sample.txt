@@ -1,0 +1,4 @@
+Plain text import
+
+Each line becomes a paragraph.
+Second line.

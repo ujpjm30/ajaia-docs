@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ajaia Docs</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/vendor/quill.snow.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Ajaia Docs</div>
+    <label class="user-picker">
+      <span>Signed in as</span>
+      <select id="user-select" aria-label="Current user"></select>
+    </label>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <button id="new-doc" class="btn primary full">+ New document</button>
+      <label class="btn full upload">
+        Import file
+        <input id="import-input" type="file" accept=".txt,.md,.docx" hidden />
+      </label>
+      <p class="hint">Import supports .txt, .md and .docx (up to 2 MB). Each file becomes a new editable document.</p>
+
+      <h3>My documents</h3>
+      <ul id="owned-list" class="doc-list"></ul>
+
+      <h3>Shared with me</h3>
+      <ul id="shared-list" class="doc-list"></ul>
+    </aside>
+
+    <main class="main">
+      <div id="empty-state" class="empty">
+        <h2>No document open</h2>
+        <p>Create a new document, import a file, or pick one from the left.</p>
+      </div>
+
+      <section id="doc-view" hidden>
+        <div class="doc-header">
+          <input id="doc-title" class="title-input" maxlength="200" aria-label="Document title" />
+          <span id="save-status" class="status"></span>
+          <div class="doc-actions">
+            <span id="access-badge" class="badge"></span>
+            <button id="export-btn" class="btn" title="Download as Markdown">Export .md</button>
+            <button id="share-btn" class="btn">Share</button>
+            <button id="delete-btn" class="btn danger">Delete</button>
+          </div>
+        </div>
+        <div id="doc-meta" class="meta"></div>
+        <div class="editor-wrap">
+          <div id="toolbar">
+            <span class="ql-formats">
+              <select class="ql-header">
+                <option value="1">Heading 1</option>
+                <option value="2">Heading 2</option>
+                <option value="3">Heading 3</option>
+                <option selected>Normal</option>
+              </select>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-bold" title="Bold (Ctrl+B)"></button>
+              <button class="ql-italic" title="Italic (Ctrl+I)"></button>
+              <button class="ql-underline" title="Underline (Ctrl+U)"></button>
+              <button class="ql-strike" title="Strikethrough"></button>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-list" value="bullet" title="Bulleted list"></button>
+              <button class="ql-list" value="ordered" title="Numbered list"></button>
+              <button class="ql-blockquote" title="Quote"></button>
+              <button class="ql-link" title="Link"></button>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-clean" title="Clear formatting"></button>
+            </span>
+          </div>
+          <div id="editor"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="share-dialog">
+    <form id="share-form" method="dialog">
+      <h3>Share document</h3>
+      <p class="hint">Demo users: alice@ajaia.test, bob@ajaia.test, carol@ajaia.test</p>
+      <div class="share-row">
+        <input id="share-email" type="email" placeholder="Email address" required />
+        <select id="share-role">
+          <option value="editor">Can edit</option>
+          <option value="viewer">Can view</option>
+        </select>
+        <button type="submit" class="btn primary" id="share-submit">Share</button>
+      </div>
+      <p id="share-error" class="error"></p>
+      <h4>People with access</h4>
+      <ul id="share-list" class="share-list"></ul>
+      <div class="dialog-actions">
+        <button type="button" id="share-close" class="btn">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="/static/vendor/quill.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
